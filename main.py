@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
-
+from torch.nn.utils.rnn import pad_sequence
 
 def set_seed(seed):
     random.seed(seed)
@@ -130,25 +130,24 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
+
+        question = []
         question_words = self.df["question"][idx].split(" ")
         for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+            question.append(self.question2idx.get(word, len(self.idx2question)))  # Unknown words mapped to extra index
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            return image, torch.Tensor(question).long(), torch.Tensor(answers).long(), int(mode_answer_idx)
 
         else:
-            return image, torch.Tensor(question)
+            return image, torch.Tensor(question).long()
 
     def __len__(self):
         return len(self.df)
+
 
 
 # 2. 評価指標の実装
@@ -288,22 +287,39 @@ def ResNet50():
 
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, vocab_size: int, embedding_dim: int, hidden_dim: int, n_answer: int, dropout_prob: float = 0.5):
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.resnet = ResNet50()
 
+        # Text encoder with an LSTM
+        self.embedding = nn.Embedding(vocab_size + 1, embedding_dim)  # +1 for the unknown token
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.text_dropout = nn.Dropout(dropout_prob)
+
+        # Fully connected layers
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(hidden_dim * 2 + 512, 512),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout_prob),
             nn.Linear(512, n_answer)
         )
 
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        # Image features
+        image_feature = self.resnet(image)  # 画像の特徴量 Output size: (batch_size, 512)
 
-        x = torch.cat([image_feature, question_feature], dim=1)
+        # Text features
+        question_embedded = self.embedding(question)  # Output size: (batch_size, seq_length, embedding_dim)
+        lstm_out, (h_n, c_n) = self.lstm(question_embedded)  # Output size: (batch_size, seq_length, hidden_dim * 2)
+
+        # Extract the last hidden state
+        question_feature = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)  # Concatenate the hidden states from the last LSTM layer
+
+        # Apply dropout
+        question_feature = self.text_dropout(question_feature) # テキストの特徴量
+
+        # Concatenate image and text features
+        x = torch.cat([image_feature, question_feature], dim=1)  # Output size: (batch_size, hidden_dim * 2 + 512)
         x = self.fc(x)
 
         return x
@@ -319,7 +335,7 @@ def train(model, dataloader, optimizer, criterion, device):
 
     start = time.time()
     for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
+        image, question, answers, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
         pred = model(image, question)
@@ -345,7 +361,7 @@ def eval(model, dataloader, optimizer, criterion, device):
 
     start = time.time()
     for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
+        image, question, answers, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
         pred = model(image, question)
@@ -357,33 +373,106 @@ def eval(model, dataloader, optimizer, criterion, device):
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
+class CosineScheduler():
+    def __init__(self, epochs, lr, warmup_length=5):
+        """
+        Arguments
+        ---------
+        epochs : int
+            学習のエポック数．
+        lr : float
+            学習率．
+        warmup_length : int
+            warmupを適用するエポック数．
+        """
+        self.epochs = epochs
+        self.lr = lr
+        self.warmup = warmup_length
+
+    def __call__(self, epoch):
+        """
+        Arguments
+        ---------
+        epoch : int
+            現在のエポック数．
+        """
+        progress = (epoch - self.warmup) / (self.epochs - self.warmup)
+        progress = np.clip(progress, 0.0, 1.0)
+        lr = self.lr * 0.5 * (1. + np.cos(np.pi * progress))
+
+        if self.warmup:
+            lr = lr * min(1., (epoch+1) / self.warmup)
+
+        return lr
+
+
+def set_lr(lr, optimizer):
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
+def collate_fn(batch):
+    images, questions, answers, mode_answers = zip(*batch)
+
+    images = torch.stack(images)
+
+    # Use clone().detach() to avoid warnings
+    questions = [q.clone().detach().long() for q in questions]
+    questions_padded = pad_sequence(questions, batch_first=True, padding_value=0)
+
+    # Use clone().detach() to avoid warnings
+    answers = [a.clone().detach().long() for a in answers]
+    answers_padded = pad_sequence(answers, batch_first=True, padding_value=0)
+
+    mode_answers = torch.tensor(mode_answers, dtype=torch.long)
+
+    return images, questions_padded, answers_padded, mode_answers
 
 def main():
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(device)
 
     # dataloader / model
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=train_transform)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=test_transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, collate_fn=collate_fn, shuffle=True)
+
+    #train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, embedding_dim=300, hidden_dim=516, n_answer=len(train_dataset.answer2idx)).to(device)
+
 
     # optimizer / criterion
     num_epoch = 20
+    lr = 0.001
+    warmup_length = 5
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = CosineScheduler(num_epoch, lr, warmup_length)
 
     # train model
     for epoch in range(num_epoch):
+        new_lr = scheduler(epoch)
+        set_lr(new_lr, optimizer)
+
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
